@@ -1,0 +1,316 @@
+
+"""
+Convert 2 order specified mrcs to npy
+"""
+
+__author__ = "Jordy Homing Lam"
+__copyright__ = "Copyright 2018, Hong Kong University of Science and Technology"
+__license__ = "3-clause BSD"
+
+
+import time
+import subprocess
+import os
+import sys
+import re
+import glob
+from io import StringIO
+from argparse import ArgumentParser
+import shutil
+import itertools
+from functools import partial
+from operator import itemgetter
+import gc
+import copy
+
+import random
+import numpy as np
+from scipy import spatial
+from scipy.spatial.distance import euclidean
+from scipy.linalg import eig
+import scipy
+from scipy import stats
+
+import matplotlib.pyplot as plt
+
+
+import pickle
+
+import torch
+from PIL import Image
+import torchvision.transforms as transforms
+from torchvision.utils import save_image, make_grid
+from torch.utils.data import DataLoader
+from torch.autograd import Variable
+#import torch.nn as nn
+#import torch.nn.functional as F
+
+from skimage.transform import resize
+
+
+from EMScripting_Supporting import *
+from models import *
+################################################
+
+parser = ArgumentParser(description="This script will dock the mer in pdb onto the target")
+parser.add_argument("--UnclearFolder", type=str, dest="unclearfolder",
+                    help="The Noisy Raw image")
+parser.add_argument("--ClearFolder", type=str, dest="clearfolder",
+                    help="The HR image")
+
+args = parser.parse_args()
+
+################################################
+
+# ======================
+# Test train split simple
+# ======================
+
+MkdirList(['images', 'saved_models'])
+
+
+# I/O provide file list
+lr_flist = sorted(glob.glob('%s/*.pkl' %(args.unclearfolder)))
+hr_flist = sorted(glob.glob('%s/*.pkl' %(args.clearfolder)))
+
+train_hr = hr_flist[0:2500]
+train_lr = lr_flist[0:2500]
+test_hr = hr_flist[2500:]
+test_lr = lr_flist[2500:]
+"""
+# Assess mean and std values for images
+mrcarray_unclear = np.array([pickle.load(open('%s' %(fn),'rb')) for fn in sorted(glob.glob('%s/*.pkl' %(args.unclearfolder)))[0:1000]])
+min_unclear = np.min(mrcarray_unclear)
+max_unclear = np.max(mrcarray_unclear)
+mean_unclear = np.mean(mrcarray_unclear)
+std_unclear = np.std(mrcarray_unclear)
+
+print(min_unclear, max_unclear, mean_unclear, std_unclear)
+
+mrcarray_clear = np.array([pickle.load(open('%s' %(fn),'rb')) for fn in sorted(glob.glob('%s/*.pkl' %(args.clearfolder)))[0:1000]])
+min_clear = np.min(mrcarray_clear)
+max_clear = np.max(mrcarray_clear)
+mean_clear = np.mean(mrcarray_clear)
+std_clear = np.std(mrcarray_clear)
+
+print(min_clear, max_clear, mean_clear, std_clear)
+
+
+sys.exit()
+"""
+# ======================================
+# Parameters
+# ======================================
+# 1 .Speed params
+# N_cpu for dataloading
+n_cpu = 16
+# Batch size
+batch_size = 5
+# number epoch
+num_epoch = 20
+
+# 2. Optimizers
+learning_rate = 0.0001
+decay_b1 = 0.9
+decay_b2 = 0.999
+
+# 3. Dimensions
+# HR shape
+hr_shape = (256,256)
+# LR Shape
+lr_shape = (64,64)
+# Color channel
+input_channel = 1
+
+
+# ======================================
+# Initialise Players
+# ======================================
+# Define Tensor
+Tensor = torch.Tensor
+
+# Players
+generator = GeneratorResNet(in_channels=3, out_channels=3)
+discriminator = Discriminator(input_shape=(3, *hr_shape))
+feature_extractor = FeatureExtractor()
+
+# Data Loading
+imagehandler = ImageDataset(lr_shape, hr_shape, train_lr, train_hr, lr_mean = 0.05, lr_std = 1.0, lr_min = -10.0, lr_max = 13.0, hr_mean = 0.56, hr_std = 1.0, hr_min = -1.0, hr_max = 7.5)
+imagehandler_test = ImageDataset(lr_shape, hr_shape, test_lr, test_hr, lr_mean = 0.05, lr_std = 1.0, lr_min = -10.0, lr_max = 13.0, hr_mean = 0.56, hr_std = 1.0, hr_min = -1.0, hr_max = 7.5)
+dataloader = DataLoader(imagehandler, batch_size = batch_size,    shuffle=True,    num_workers=n_cpu)
+dataloader_test = DataLoader(imagehandler_test, batch_size = batch_size,    shuffle=True,    num_workers=n_cpu)
+# Optimizers
+optimizer_G = torch.optim.Adam(generator.parameters(), lr= learning_rate, betas=(decay_b1, decay_b2))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr= learning_rate, betas=(decay_b1, decay_b2))
+
+# Losses
+# NOTE 
+#criterion_GAN = torch.nn.L1Loss() #torch.nn.BCELoss(weight=None, size_average=None, reduce=None, reduction='mean')
+criterion_GAN = torch.nn.BCELoss(weight=None, size_average=None, reduce=None, reduction='mean')
+criterion_content = torch.nn.MSELoss()
+
+# Activate cuda
+cuda = torch.cuda.is_available()
+torch.cuda.set_device(1)
+if cuda:
+    generator = generator.cuda()
+    discriminator = discriminator.cuda()
+    feature_extractor = feature_extractor.cuda()
+    criterion_GAN = criterion_GAN.cuda()
+    criterion_content = criterion_content.cuda()
+    Tensor = torch.cuda.FloatTensor
+
+
+# =======================================
+# Training Process
+# =======================================
+
+
+for epoch in range(0,num_epoch):
+    outF = open("%s/Epoch_%s.txt" %('saved_models', epoch), "w+")
+    outF.write('%s,%s,%s,%s\n' %('Batch_Done' , 'D_loss_train', 'G_loss_train', 'G_loss_test'))
+    outF.close() 
+    for (i, (imgs, imgs_test)) in enumerate(zip(dataloader, dataloader_test)):
+
+        # Configure model input
+        imgs_lr = Variable(imgs["lr"].type(Tensor))
+        imgs_hr = Variable(imgs["hr"].type(Tensor))
+
+
+        imgs_lr_test = Variable(imgs_test["lr"].type(Tensor))
+        imgs_hr_test = Variable(imgs_test["hr"].type(Tensor))
+
+        #fig,ax = plt.subplots(1,1,figsize = (5,5))
+        #ax.imshow(imgs_hr.cpu().numpy()[0,0,:,:], cmap = "gray")
+        #plt.show()
+
+
+        #sys.exit()
+        # Adversarial ground truths
+        valid = Variable(Tensor(np.ones((imgs_lr.size(0), *discriminator.output_shape))), requires_grad=False)
+        fake = Variable(Tensor(np.zeros((imgs_lr.size(0), *discriminator.output_shape))), requires_grad=False)
+
+        # ------------------
+        #  Train Generators
+        # ------------------
+
+        optimizer_G.zero_grad()
+
+        # Generate a high resolution image from low resolution input
+        gen_hr = generator(imgs_lr)
+
+        gen_hr_test = generator(imgs_lr_test)
+
+        # Adversarial loss
+        loss_GAN = criterion_GAN(discriminator(gen_hr), valid)
+        loss_GAN_test = criterion_GAN(discriminator(gen_hr_test), valid)
+
+        # Content loss
+        # VGG MSE Loss NOTE Deteriorate result
+        #gen_features = feature_extractor(gen_hr)
+        #real_features = feature_extractor(imgs_hr)
+        #loss_content = criterion_content(gen_features, real_features.detach())
+        loss_content = criterion_content(gen_hr, imgs_hr)
+        loss_content_test = criterion_content(gen_hr_test, imgs_hr_test)
+        
+
+        # Total loss
+        loss_G = 10.0 * loss_content + 1e-2 * loss_GAN
+        loss_G_test = 10.0 * loss_content_test + 1e-2 * loss_GAN_test
+
+        loss_G.backward()
+        optimizer_G.step()
+
+        # ---------------------
+        #  Train Discriminator
+        # ---------------------
+
+        optimizer_D.zero_grad()
+
+        # Loss of real and fake images
+        loss_real = criterion_GAN(discriminator(imgs_hr), valid)
+        loss_fake = criterion_GAN(discriminator(gen_hr.detach()), fake)
+
+        # Total loss
+        loss_D = (loss_real + loss_fake) / 2
+
+        loss_D.backward()
+        optimizer_D.step()
+
+        #print("We are at epoch %s with L1 %s MSE %s Discriminator %s" %(epoch, loss_GAN, loss_content, loss_D))
+        print("[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]" % (epoch, num_epoch, i, len(dataloader), loss_D.item(), loss_G.item()))
+
+
+
+        batches_done = epoch * len(dataloader) + i
+        # Batchdone, D loss train, G loss train, D loss test, Gloss test
+        outF = open("%s/Epoch_%s.txt" %('saved_models', epoch), "a")
+        outF.write('%s,%s,%s,%s\n' %(str(batches_done), str(loss_D.item()), str(loss_G.item()), str(loss_G_test.item())))
+        outF.close()
+        if True:
+            # Save training
+            hr = imgs_hr.cpu().detach().numpy()
+            sr = gen_hr.cpu().detach().numpy()
+            lr = imgs_lr.cpu().detach().numpy()
+            lr = resize(lr[0,0,:,:] , (256, 256), mode='constant')
+            lr = (lr -np.min(lr) )/ np.max(lr) * 0.2
+            fig,ax = plt.subplots(1,1,figsize = (8,12))
+            ax.imshow(np.concatenate((np.mean(sr[0,:,:,:], axis = 0), hr[0,0,:,:] , lr), axis = 0), cmap = "gray")
+            #ax.imshow(np.concatenate((np.mean(sr[0,:,:,:], axis = 0), hr[0,0,:,:]), axis = 0), cmap = "gray")
+            plt.savefig('images/%d.png' %(batches_done))
+            plt.close()
+            plt.clf()
+            del ax, fig
+
+            # Save training
+            hr = imgs_hr_test.cpu().detach().numpy()
+            sr = gen_hr_test.cpu().detach().numpy()
+            lr = imgs_lr_test.cpu().detach().numpy()
+            lr = resize(lr[0,0,:,:] , (256, 256), mode='constant')
+            lr = (lr -np.min(lr) )/ np.max(lr) *0.2
+            fig,ax = plt.subplots(1,1,figsize = (8,12))
+            ax.imshow(np.concatenate((np.mean(sr[0,:,:,:], axis = 0), hr[0,0,:,:] , lr), axis = 0), cmap = "gray")
+            #ax.imshow(np.concatenate((np.mean(sr[0,:,:,:], axis = 0), hr[0,0,:,:]), axis = 0), cmap = "gray")
+            plt.savefig('images/%d_test.png' %(batches_done))
+            plt.close()
+            plt.clf()
+            del ax, fig
+
+
+ 
+
+    torch.save(generator.state_dict(), "saved_models/generator_%d.pth" % epoch)
+    torch.save(discriminator.state_dict(), "saved_models/discriminator_%d.pth" % epoch)
+
+
+
+
+
+sys.exit()
+# ===================
+# I/O
+# ===================
+
+# TODO Put as read MRCS pages
+def BasicReadMRCs(flist):
+    
+  mrcarray_clear_page = []
+  for fn in sorted(glob.glob('EM_Clear/*.mrcs')):
+    Voxel = basic_read_mrc(fn)[0]
+    for i in range(Voxel.shape[-1]):
+        mrcarray_clear_page.append(Voxel[:,:,i])
+  return mrcarray_clear_page
+
+# 1. Input as a list of frames 2D
+mrcarray_clear_page = BasicReadMRCs(sorted(glob.glob('%s/*.mrcs' %(args.clearfolder))))
+mrcarray_unclear_page = BasicReadMRCs(sorted(glob.glob('%s/*.mrcs' %(args.unclearfolder))))
+
+# 2. Output each corresponding page into a np array
+MkdirList(['EM_ClearNpy', 'EM_UnclearNpy'])
+for i in range(len(mrcarray_clear_page)):
+    pickle.dump(mrcarray_clear_page[i], open('EM_ClearNpy/%s.pkl'%(i),'wb'))
+for i in range(len(mrcarray_unclear_page)):
+    pickle.dump(mrcarray_clear_page[i], open('EM_UnclearNpy/%s.pkl'%(i),'wb'))
+
+
+
