@@ -3,9 +3,7 @@
 Convert 2 order specified mrcs to npy
 """
 
-__author__ = "Jordy Homing Lam"
-__copyright__ = "Copyright 2018, Hong Kong University of Science and Technology"
-__license__ = "3-clause BSD"
+
 
 
 import time
