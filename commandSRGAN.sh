@@ -5,9 +5,7 @@
 
 #=============================================================
 
-#__author__ = "Jordy Homing Lam"
-#__copyright__ = "Copyright 2019, Hong Kong University of Science and Technology"
-#__license__ = "3-clause BSD"
+
 
 
 SCRIPTHOME='Scripts/EMScripting'
